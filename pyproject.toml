@@ -13,7 +13,6 @@ packages = [
 python = "^3.8"
 peewee = "^3.15.4"
 
-aiopg = { version = "^1.4.0", optional = true }
 psycopg = { version = "^3.1.18", optional = true }
 psycopg_pool = { version = "^3.2.1", optional = true }
 aiomysql = { version = "^0.2.0", optional = true }
@@ -26,10 +25,10 @@ sphinx-rtd-theme = { version = "^1.3.0rc1", optional = true }
 
 
 [tool.poetry.extras]
-postgresql = ["aiopg"]
+postgresql = ["psycopg", "psycopg_pool"]
 mysql = ["aiomysql", "cryptography"]
-develop = ["aiopg", "aiomysql", "cryptography", "pytest", "pytest-asyncio"]
-docs = ["aiopg", "aiomysql", "cryptography", "sphinx", "sphinx-rtd-theme"]
+develop = ["psycopg", "psycopg_pool", "aiomysql", "cryptography", "pytest", "pytest-asyncio"]
+docs = ["psycopg", "psycopg_pool", "aiomysql", "cryptography", "sphinx", "sphinx-rtd-theme"]
 
 [build-system]
 requires = ["poetry-core"]
