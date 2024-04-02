@@ -20,19 +20,23 @@ import logging
 import uuid
 import warnings
 
+from typing import Optional
+
 import peewee
 from importlib.metadata import version
 from playhouse.db_url import register_database
+from playhouse.psycopg3_ext import Psycopg3Database
+from psycopg import AsyncClientCursor
+from psycopg_pool import AsyncConnectionPool
 
 IntegrityErrors = (peewee.IntegrityError,)
 
 try:
-    import aiopg
-    import psycopg2
-    IntegrityErrors += (psycopg2.IntegrityError,)
+    import psycopg
+
+    IntegrityErrors += (psycopg.IntegrityError,)
 except ImportError:
-    aiopg = None
-    psycopg2 = None
+    psycopg = None
 
 try:
     import aiomysql
@@ -875,40 +879,63 @@ class AsyncDatabase:
 ##############
 
 
+class PostgresqlAsyncCursorProxy(AsyncClientCursor):
+    """Proxy type of psycopg AsyncClientCursor to rewrite __slots__
+    with __dict__ (for settatr in it)
+    """
+    pass
+
+
 class AsyncPostgresqlConnection:
     """Asynchronous database connection pool.
     """
     def __init__(self, *, database=None, loop=None, timeout=None, **kwargs):
-        self.pool = None
+        self.pool = None  # type: Optional[AsyncConnectionPool]
         self.loop = loop
         self.database = database
-        self.timeout = timeout or aiopg.DEFAULT_TIMEOUT
+        self.timeout = timeout or 60  # TODO or aiopg.DEFAULT_TIMEOUT
         self.connect_params = kwargs
 
     async def acquire(self):
         """Acquire connection from pool.
         """
-        return (await self.pool.acquire())
+        return await self.pool.getconn()
 
-    def release(self, conn):
+    async def release(self, conn):
         """Release connection to pool.
         """
-        self.pool.release(conn)
+        await self.pool.putconn(conn)
 
     async def connect(self):
         """Create connection pool asynchronously.
         """
-        self.pool = await aiopg.create_pool(
-            loop=self.loop,
-            timeout=self.timeout,
-            database=self.database,
-            **self.connect_params)
+        # TODO: move dsn build to utils func
+
+        host = self.connect_params['host']
+        port = self.connect_params['port']
+        user = self.connect_params['user']
+        password = self.connect_params['password']
+        dsn = f'postgresql://{user}:{password}@{host}:{port}/{self.database}'
+
+        # TODO: provide interface to pass all params to AsyncConnectionPool and Connection itself
+        self.pool = AsyncConnectionPool(
+            dsn,
+            min_size=self.connect_params.get('min_size', 1),
+            max_size=self.connect_params.get('max_size', 20),
+            max_lifetime=self.connect_params.get('pool_recycle', 60 * 60.0),
+            open=False,
+            kwargs={
+                'cursor_factory': AsyncClientCursor,
+                'autocommit': True,
+            }
+        )
+        # self.pool
+        await self.pool.open()
 
     async def close(self):
         """Terminate all pool connections.
         """
-        self.pool.terminate()
-        await self.pool.wait_closed()
+        await self.pool.close()
 
     async def cursor(self, conn=None, *args, **kwargs):
         """Get a cursor for the specified transaction connection
@@ -917,33 +944,49 @@ class AsyncPostgresqlConnection:
         in_transaction = conn is not None
         if not conn:
             conn = await self.acquire()
-        cursor = await conn.cursor(*args, **kwargs)
+
+        raw_cursor = conn.cursor(*args, **kwargs)
+
+        # proxy object to get rid of __slots__ to do setattr
+        cursor = PostgresqlAsyncCursorProxy(
+            connection=raw_cursor.connection,
+            row_factory=raw_cursor.row_factory,
+        )
+
         cursor.release = functools.partial(
-            self.release_cursor, cursor,
-            in_transaction=in_transaction)
+            self.release_cursor,
+            cursor,
+            in_transaction=in_transaction
+        )
+
         return cursor
 
     async def release_cursor(self, cursor, in_transaction=False):
         """Release cursor coroutine. Unless in transaction,
         the connection is also released back to the pool.
         """
-        conn = cursor.connection
-        cursor.close()
+        await cursor.close()
+
         if not in_transaction:
-            self.release(conn)
+            await self.release(cursor.connection)
 
 
 class AsyncPostgresqlMixin(AsyncDatabase):
     """Mixin for `peewee.PostgresqlDatabase` providing extra methods
     for managing async connection.
     """
-    if psycopg2:
-        Error = psycopg2.Error
+    Error = psycopg.Error
 
-    def init_async(self, conn_cls=AsyncPostgresqlConnection,
-                   enable_json=False, enable_hstore=False):
-        if not aiopg:
-            raise Exception("Error, aiopg is not installed!")
+    def init_async(
+        self,
+        conn_cls=AsyncPostgresqlConnection,
+
+        # TODO: check if psycopg3 handle json without any configs
+        enable_json=False,
+        # TODO: check if psycopg3 handle hstore
+        #  (! maybe dict cursor here break something)
+        enable_hstore=False,
+    ):
         self._async_conn_cls = conn_cls
         self._enable_json = enable_json
         self._enable_hstore = enable_hstore
@@ -954,10 +997,11 @@ class AsyncPostgresqlMixin(AsyncDatabase):
         """
         kwargs = self.connect_params.copy()
         kwargs.update({
-            'minsize': self.min_connections,
-            'maxsize': self.max_connections,
+            'min_size': self.min_connections,
+            'max_size': self.max_connections,
             'enable_json': self._enable_json,
             'enable_hstore': self._enable_hstore,
+            'autocommit': True,
         })
         return kwargs
 
@@ -972,8 +1016,22 @@ class AsyncPostgresqlMixin(AsyncDatabase):
         #     pass
         return cursor.lastrowid
 
+    async def pop_transaction_async(self):
+        # TODO: may be redundant, but for now we need 'await' in self._async_conn.release(conn)
+        """Decrement async transaction depth.
+        """
+        depth = self.transaction_depth_async()
+        if depth > 0:
+            depth -= 1
+            self._task_data.set('depth', depth)
+            if depth == 0:
+                conn = self._task_data.get('conn')
+                await self._async_conn.release(conn)
+        else:
+            raise ValueError("Invalid async transaction depth value")
 
-class PostgresqlDatabase(AsyncPostgresqlMixin, peewee.PostgresqlDatabase):
+
+class PostgresqlDatabase(AsyncPostgresqlMixin, Psycopg3Database):
     """PosgreSQL database driver providing **single drop-in sync** connection
     and **single async connection** interface.
 
@@ -1002,8 +1060,7 @@ class PostgresqlDatabase(AsyncPostgresqlMixin, peewee.PostgresqlDatabase):
 register_database(PostgresqlDatabase, 'postgres+async', 'postgresql+async')
 
 
-class PooledPostgresqlDatabase(AsyncPostgresqlMixin,
-                               peewee.PostgresqlDatabase):
+class PooledPostgresqlDatabase(AsyncPostgresqlMixin, Psycopg3Database):
     """PosgreSQL database driver providing **single drop-in sync**
     connection and **async connections pool** interface.
 
@@ -1019,7 +1076,7 @@ class PooledPostgresqlDatabase(AsyncPostgresqlMixin,
     def init(self, database, **kwargs):
         self.min_connections = kwargs.pop('min_connections', 1)
         self.max_connections = kwargs.pop('max_connections', 20)
-        self._timeout = kwargs.pop('connection_timeout', aiopg.DEFAULT_TIMEOUT)
+        self._timeout = kwargs.pop('connection_timeout', 10)  # TODO: socket._GLOBAL_DEFAULT_TIMEOUT?
         super().init(database, **kwargs)
         self.init_async()
 
