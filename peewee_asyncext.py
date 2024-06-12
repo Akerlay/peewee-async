@@ -13,13 +13,16 @@ Licensed under The MIT License (MIT)
 Copyright (c) 2014, Alexey Kinëv <rudy@05bit.com>
 
 """
-from playhouse import postgres_ext as ext
+from playhouse import psycopg3_ext as ext
 from playhouse.db_url import register_database
 
-from peewee_async import AsyncPostgresqlMixin, aiopg
+from peewee_async import AsyncPostgresqlMixin
+
+# TODO: check hstore and json and maybe get rid of it?
+#  (import from peewee_async and export same classes for backward capability)
 
 
-class PostgresqlExtDatabase(AsyncPostgresqlMixin, ext.PostgresqlExtDatabase):
+class PostgresqlExtDatabase(AsyncPostgresqlMixin, ext.Psycopg3Database):
     """PosgreSQL database extended driver providing **single drop-in sync**
     connection and **single async connection** interface.
 
@@ -37,8 +40,8 @@ class PostgresqlExtDatabase(AsyncPostgresqlMixin, ext.PostgresqlExtDatabase):
         self.min_connections = 1
         self.max_connections = 1
         super().init(database, **kwargs)
-        self.init_async(enable_json=True,
-                        enable_hstore=self._register_hstore)
+        self.init_async(enable_json=True)
+
 
     @property
     def use_speedups(self):
@@ -54,7 +57,7 @@ register_database(PostgresqlExtDatabase, 'postgresext+async',
 
 
 class PooledPostgresqlExtDatabase(AsyncPostgresqlMixin,
-                                  ext.PostgresqlExtDatabase):
+                                  ext.Psycopg3Database):
     """PosgreSQL database extended driver providing **single drop-in sync**
     connection and **async connections pool** interface.
 
@@ -74,10 +77,9 @@ class PooledPostgresqlExtDatabase(AsyncPostgresqlMixin,
     def init(self, database, **kwargs):
         self.min_connections = kwargs.pop('min_connections', 1)
         self.max_connections = kwargs.pop('max_connections', 20)
-        self._timeout = kwargs.pop('connection_timeout', aiopg.DEFAULT_TIMEOUT)
+        self._timeout = kwargs.pop('connection_timeout', 10)  # TODO: socket._GLOBAL_DEFAULT_TIMEOUT?
         super().init(database, **kwargs)
-        self.init_async(enable_json=True,
-                        enable_hstore=self._register_hstore)
+        self.init_async(enable_json=True)
 
     @property
     def use_speedups(self):

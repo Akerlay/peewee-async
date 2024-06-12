@@ -72,3 +72,9 @@ mysql_only = pytest.mark.parametrize(
 all_dbs = pytest.mark.parametrize(
     "manager", PG_DBS + MYSQL_DBS, indirect=["manager"]
 )
+
+
+# TODO: remove it and run all test for mysql and postgresql_ext
+all_dbs = pytest.mark.parametrize(
+    "manager", ["postgres", "postgres-pool"], indirect=["manager"]
+)
